@@ -29,8 +29,26 @@ def data_dir(tmp_path: Path) -> Path:
 
 
 @pytest.fixture()
-def svc(data_dir: Path) -> MoistureService:
-    return MoistureService(Settings(data_dir=data_dir))
+def new_data_dir(tmp_path: Path) -> Path:
+    d = tmp_path / "new-data"
+    d.mkdir()
+    return d
+
+
+@pytest.fixture()
+def settings(data_dir: Path, new_data_dir: Path) -> Settings:
+    # 迁移后台线程的重试参数调小，测试失败路径快速收敛
+    return Settings(
+        data_dir=data_dir,
+        new_data_dir=new_data_dir,
+        migration_retry_delay_seconds=0.01,
+        migration_max_attempts=2,
+    )
+
+
+@pytest.fixture()
+def svc(settings: Settings) -> MoistureService:
+    return MoistureService(settings)
 
 
 @pytest.fixture()
@@ -49,9 +67,9 @@ def _free_port() -> int:
 
 
 @pytest.fixture()
-def live_server(data_dir: Path):
+def live_server(settings: Settings):
     """真实 uvicorn 服务器（随机端口）+ httpx 客户端，用于流式并发测试。"""
-    service = MoistureService(Settings(data_dir=data_dir))
+    service = MoistureService(settings)
     main.service = service
     port = _free_port()
     config = uvicorn.Config(

@@ -1,4 +1,4 @@
-"""FastAPI 入口：分区上传/下载、快照固定/释放、回收触发与状态查看。"""
+"""FastAPI 入口：分区上传/下载、快照固定/释放、回收、双卷迁移与进度查询。"""
 from __future__ import annotations
 
 import os
@@ -8,7 +8,6 @@ from typing import Optional
 from fastapi import FastAPI, File, HTTPException, Path as PathParam, Query, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import storage
 from .config import settings
 from .service import (
     CsvValidationError,
@@ -25,17 +24,21 @@ service = MoistureService(settings)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    # 建表 + 崩溃恢复：清理临时文件、对账数据卷、继续未完成的回收
+    # 建表 + 崩溃恢复：清理临时文件、对账数据卷、继续未完成的回收与迁移
     service.startup()
-    yield
+    try:
+        yield
+    finally:
+        service.shutdown()
 
 
 app = FastAPI(
     title="土壤湿度分区内容寻址存储 API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "按日期分区上传 CSV（站点、湿度），整份替换当前分区；"
-        "相同字节按 SHA-256 共用数据卷文件；支持快照固定/释放与安全回收。"
+        "相同字节按 SHA-256 共用数据卷文件；支持快照固定/释放与安全回收；"
+        "支持旧卷到新卷的一次性单向迁移（受理即返回进度号）。"
     ),
     lifespan=lifespan,
 )
@@ -60,7 +63,12 @@ def _too_large_handler(_request, exc: UploadTooLarge):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "data_dir": str(service.cfg.data_dir)}
+    return {
+        "status": "ok",
+        "data_dir": str(service.cfg.data_dir),
+        "new_data_dir": str(service.cfg.new_data_dir),
+        "blob_files": service.blob_file_counts(),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -107,7 +115,7 @@ def download_partition(
     上传/释放/其他文件回收，且本文件在下载结束前不会被回收。
     """
     try:
-        sha, path, cleanup = service.open_partition_download(partition_id, snapshot_id)
+        sha, handle, cleanup = service.open_partition_download(partition_id, snapshot_id)
     except NotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except SnapshotReleased as exc:
@@ -115,7 +123,7 @@ def download_partition(
     except MissingBlobFile as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
-    stream = service.stream_blob(path, cleanup)
+    stream = service.stream_blob(handle, cleanup)
     filename = f"{partition_id}.csv"
     headers = {
         "Content-Disposition": f'attachment; filename="{filename}"',
@@ -162,11 +170,40 @@ def run_gc():
 
 @app.get("/gc/status")
 def gc_status():
+    counts = service.blob_file_counts()
     return {
         "queue_remaining": service.gc_queue_size(),
         "active_downloads": service.active_reader_count(),
-        "blob_files_on_disk": len(storage.list_blob_files(service.cfg)),
+        "blob_files_on_disk": counts["total"],
+        "old_volume_blob_files": counts["old"],
+        "new_volume_blob_files": counts["new"],
     }
+
+
+# --------------------------------------------------------------------------- #
+# 旧卷 -> 新卷单向迁移
+# --------------------------------------------------------------------------- #
+@app.post("/migrations", status_code=202)
+def request_migration():
+    """受理一次单向迁移，立即返回进度号；实际复制在后台继续。
+
+    重复发起（含迁移已完成）沿用同一进度号，不会重复搬运。
+    """
+    return service.request_migration()
+
+
+@app.get("/migrations")
+def list_migrations():
+    return {"migrations": service.list_migrations()}
+
+
+@app.get("/migrations/{migration_id}")
+def get_migration(migration_id: int):
+    """按进度号查询迁移进度（各状态计数、百分比、卷分布与错误）。"""
+    try:
+        return service.get_migration(migration_id)
+    except NotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
 
 
 if __name__ == "__main__":

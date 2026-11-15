@@ -3,6 +3,7 @@ FROM python:3.11-slim
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     DATA_DIR=/data \
+    NEW_DATA_DIR=/new-data \
     HOST=0.0.0.0 \
     PORT=8000
 
@@ -14,9 +15,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
-# 数据卷：SQLite 数据库与 blobs 数据卷
-RUN mkdir -p /data
-VOLUME ["/data"]
+# 两个独立数据卷：SQLite 与旧 blobs 留在 /data，迁移目标为 /new-data。
+# 两者必须是不同的挂载点（config 会拒绝相同根目录）。
+RUN mkdir -p /data /new-data
+VOLUME ["/data", "/new-data"]
 
 EXPOSE 8000
 

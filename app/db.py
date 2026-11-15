@@ -25,7 +25,10 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS blobs (
     sha256     TEXT PRIMARY KEY,
     size      INTEGER NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    -- 该 blob 当前从哪个数据卷读取：old（旧卷）/ new（新卷）。
+    -- 迁移只有在目标副本完整校验通过后才切换到这里。
+    volume     TEXT NOT NULL DEFAULT 'old'
 );
 
 CREATE TABLE IF NOT EXISTS partitions (
@@ -79,13 +82,55 @@ CREATE TABLE IF NOT EXISTS gc_queue (
     last_error  TEXT
 );
 
+-- 迁移任务：一次「旧卷 -> 新卷」单向迁移。fingerprint 唯一，重复发起沿用
+-- 同一任务（同一进度号）；任务与条目都持久化，重启后可以接着做。
+CREATE TABLE IF NOT EXISTS migration_jobs (
+    job_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint  TEXT NOT NULL UNIQUE,
+    status       TEXT NOT NULL,              -- pending/running/failed/completed
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    completed_at TEXT,
+    total_items  INTEGER NOT NULL DEFAULT 0,
+    last_error   TEXT
+);
+
+-- 迁移条目按 SHA-256 逐文件推进：pending -> copied -> deleted/gone。
+-- 刻意不对 blobs 建外键：blob 可能在复制途中被回收，迟到的复制结果
+-- 必须能识别「登记已不在」，而不是重建登记。
+CREATE TABLE IF NOT EXISTS migration_items (
+    job_id     INTEGER NOT NULL,
+    sha256     TEXT NOT NULL,
+    status     TEXT NOT NULL,                -- pending/copied/deleted/gone
+    size       INTEGER NOT NULL DEFAULT 0,
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (job_id, sha256),
+    FOREIGN KEY (job_id) REFERENCES migration_jobs(job_id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_partition_entries_blob
     ON partition_entries(blob_sha);
 CREATE INDEX IF NOT EXISTS idx_snapshot_entries_blob
     ON snapshot_entries(blob_sha);
 CREATE INDEX IF NOT EXISTS idx_leases_blob
     ON download_leases(blob_sha);
+CREATE INDEX IF NOT EXISTS idx_migration_items_status
+    ON migration_items(job_id, status);
 """
+
+# 旧数据库升级：CREATE TABLE IF NOT EXISTS 不会补列，这里显式补 volume。
+MIGRATION_COLUMNS = (
+    ("blobs", "volume", "TEXT NOT NULL DEFAULT 'old'"),
+)
+
+
+def _ensure_columns(conn: sqlite3.Connection) -> None:
+    for table, column, ddl in MIGRATION_COLUMNS:
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
 def connect(cfg: Settings = default_settings) -> sqlite3.Connection:
@@ -113,10 +158,14 @@ def init_db(cfg: Settings = default_settings) -> None:
     Path(cfg.data_dir).mkdir(parents=True, exist_ok=True)
     cfg.blobs_dir.mkdir(parents=True, exist_ok=True)
     cfg.tmp_dir.mkdir(parents=True, exist_ok=True)
+    cfg.new_blobs_dir.mkdir(parents=True, exist_ok=True)
+    cfg.new_tmp_dir.mkdir(parents=True, exist_ok=True)
     conn = connect(cfg)
     try:
         conn.execute("BEGIN IMMEDIATE;")
         conn.executescript(SCHEMA)
+        # executescript 会隐式提交；补列放在其后、单独事务里
+        _ensure_columns(conn)
         conn.execute("DELETE FROM download_leases;")
         conn.commit()
     except Exception:

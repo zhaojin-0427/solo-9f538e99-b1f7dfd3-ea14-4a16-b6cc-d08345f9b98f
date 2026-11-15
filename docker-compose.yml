@@ -7,11 +7,14 @@ services:
       - "8000:8000"
     environment:
       DATA_DIR: /data
+      # 新数据卷：迁移目标，SQLite 始终留在 /data
+      NEW_DATA_DIR: /new-data
       # 下载租约保留时长（秒），仅用于防御性清理
       LEASE_TTL_SECONDS: "3600"
       MAX_UPLOAD_BYTES: "67108864"
     volumes:
       - moisture-data:/data
+      - moisture-data-new:/new-data
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"]
@@ -22,3 +25,4 @@ services:
 
 volumes:
   moisture-data:
+  moisture-data-new:

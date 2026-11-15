@@ -25,15 +25,19 @@ def test_upload_then_download_roundtrip(client):
     assert r.headers["X-Blob-SHA256"] == body["sha256"]
 
 
-def test_identical_bytes_share_one_blob_file(client, data_dir: Path):
+def test_identical_bytes_share_one_blob_file(client, data_dir: Path, new_data_dir: Path):
     csv1 = make_csv([("S1", 0.1), ("S2", 0.2)])
     a = upload(client, "2026-11-15", csv1).json()["sha256"]
     b = upload(client, "2026-11-16", csv1).json()["sha256"]
     assert a == b
 
-    blobs = list((data_dir / "blobs").rglob("*"))
-    files = [p for p in blobs if p.is_file()]
-    assert len(files) == 1  # 相同字节只有一个数据卷文件
+    files = [
+        p
+        for root in (data_dir / "blobs", new_data_dir / "blobs")
+        for p in root.rglob("*")
+        if p.is_file()
+    ]
+    assert len(files) == 1  # 相同字节只有一个数据卷文件（两卷合计）
 
 
 def test_replacement_keeps_old_version_via_snapshot_and_gcs_unreferenced(client, data_dir: Path):

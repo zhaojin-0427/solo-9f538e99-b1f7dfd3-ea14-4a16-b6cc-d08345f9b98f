@@ -30,7 +30,9 @@ def test_registration_failure_keeps_old_partition(client, data_dir: Path, monkey
     assert leftovers == []
 
 
-def test_restart_resumes_gc_and_preserves_references(client, data_dir: Path, svc):
+def test_restart_resumes_gc_and_preserves_references(
+    client, data_dir: Path, new_data_dir: Path, svc
+):
     csv_v1 = make_csv([("S1", 0.1)])
     csv_v2 = make_csv([("S1", 0.2)])
     sha_v1 = upload(client, "day", csv_v1).json()["sha256"]
@@ -111,11 +113,64 @@ def test_orphan_disk_file_is_reconciled_on_restart(data_dir: Path):
     assert not p.exists()
 
 
-def test_sqlite_foreign_keys_and_wal_enabled(data_dir: Path):
+def test_init_db_upgrades_legacy_schema_with_volume_column(data_dir: Path, new_data_dir: Path):
+    """旧库（无 volume 列、无迁移表）启动时平滑升级，既有登记视为旧卷。"""
     from app.config import Settings
     from app.db import connect, init_db
 
-    cfg = Settings(data_dir=data_dir)
+    legacy = sqlite3.connect(data_dir / "moisture.db")
+    legacy.executescript(
+        """
+        CREATE TABLE blobs (
+            sha256 TEXT PRIMARY KEY, size INTEGER NOT NULL, created_at TEXT NOT NULL);
+        CREATE TABLE partitions (
+            partition_id TEXT PRIMARY KEY, current_blob TEXT,
+            row_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE partition_entries (
+            partition_id TEXT NOT NULL, row_index INTEGER NOT NULL,
+            station TEXT NOT NULL, moisture REAL NOT NULL, blob_sha TEXT NOT NULL,
+            PRIMARY KEY (partition_id, row_index));
+        CREATE TABLE snapshots (
+            snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL, released_at TEXT);
+        CREATE TABLE snapshot_entries (
+            snapshot_id INTEGER NOT NULL, partition_id TEXT NOT NULL,
+            blob_sha TEXT NOT NULL, row_count INTEGER NOT NULL,
+            PRIMARY KEY (snapshot_id, partition_id));
+        CREATE TABLE download_leases (
+            lease_id TEXT PRIMARY KEY, blob_sha TEXT NOT NULL,
+            created_at TEXT NOT NULL, expires_at TEXT NOT NULL);
+        CREATE TABLE gc_queue (
+            sha256 TEXT PRIMARY KEY, enqueued_at TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT);
+        INSERT INTO blobs VALUES ('a' || substr(hex(randomblob(31)), 1, 63), 1, 'x');
+        """
+    )
+    legacy.commit()
+    legacy.close()
+
+    cfg = Settings(data_dir=data_dir, new_data_dir=new_data_dir)
+    init_db(cfg)
+    conn = connect(cfg)
+    try:
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(blobs)")}
+        assert "volume" in columns
+        assert conn.execute("SELECT volume FROM blobs").fetchone()[0] == "old"
+        tables = {
+            r[0]
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        assert {"migration_jobs", "migration_items"} <= tables
+    finally:
+        conn.close()
+
+
+def test_sqlite_foreign_keys_and_wal_enabled(data_dir: Path, new_data_dir: Path):
+    from app.config import Settings
+    from app.db import connect, init_db
+
+    cfg = Settings(data_dir=data_dir, new_data_dir=new_data_dir)
     init_db(cfg)
     conn = connect(cfg)
     try:
